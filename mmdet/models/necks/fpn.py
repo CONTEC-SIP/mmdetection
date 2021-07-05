@@ -1,11 +1,13 @@
 import warnings
 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import ConvModule
-from mmcv.runner import BaseModule, auto_fp16
 
 from ..builder import NECKS
+
+from mmcv.cnn import ConvModule
+from mmcv.runner import BaseModule, auto_fp16
 
 
 @NECKS.register_module()
@@ -78,6 +80,7 @@ class FPN(BaseModule):
                  norm_cfg=None,
                  act_cfg=None,
                  upsample_cfg=dict(mode='nearest'),
+                 modified=None,
                  init_cfg=dict(
                      type='Xavier', layer='Conv2d', distribution='uniform')):
         super(FPN, self).__init__(init_cfg)
@@ -90,6 +93,7 @@ class FPN(BaseModule):
         self.no_norm_on_lateral = no_norm_on_lateral
         self.fp16_enabled = False
         self.upsample_cfg = upsample_cfg.copy()
+        self.modified = modified
 
         if end_level == -1:
             self.backbone_end_level = self.num_ins
@@ -119,6 +123,8 @@ class FPN(BaseModule):
 
         self.lateral_convs = nn.ModuleList()
         self.fpn_convs = nn.ModuleList()
+        if self.modified == 'ASPP':
+            self.ASPPs = nn.ModuleList()
 
         for i in range(self.start_level, self.backbone_end_level):
             l_conv = ConvModule(
@@ -138,6 +144,10 @@ class FPN(BaseModule):
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg,
                 inplace=False)
+
+            if self.modified == 'ASPP':
+                aspp = ASPP(out_channels)
+                self.ASPPs.append(aspp)
 
             self.lateral_convs.append(l_conv)
             self.fpn_convs.append(fpn_conv)
@@ -186,11 +196,17 @@ class FPN(BaseModule):
                 laterals[i - 1] += F.interpolate(
                     laterals[i], size=prev_shape, **self.upsample_cfg)
 
-        # build outputs
-        # part 1: from original levels
-        outs = [
-            self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)
-        ]
+        if self.modified == 'ASPP':
+            outs = [
+                self.ASPPs[i](laterals[i]) for i in range(used_backbone_levels)
+            ]
+        else:
+            # build outputs
+            # part 1: from original levels
+            outs = [
+                self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)
+            ]
+
         # part 2: add extra levels
         if self.num_outs > len(outs):
             # use max pool to get more levels on top of outputs
@@ -215,3 +231,80 @@ class FPN(BaseModule):
                     else:
                         outs.append(self.fpn_convs[i](outs[-1]))
         return tuple(outs)
+
+
+class ASPP(nn.Module):
+    def __init__(self, in_planes):
+        # A trous Spatial Pyramid Pooling
+        # Deeplab v2에서 소개된 풀링 방법으로, 빈 공간을 둔 필터를 여러개 병렬로 나열하여 연산량을 줄이고 스케일에 강하게 만드는 방법
+        # semantic segmentation 분야에서 주로 쓰임
+
+        super(ASPP, self).__init__()
+        dilations = [1, 6, 12, 18]
+        batch_norm = nn.BatchNorm2d
+        self.aspp1 = ASPPBlock(in_planes, 256, 3, padding=1, dilation=dilations[0], batch_norm=batch_norm)
+        self.aspp2 = ASPPBlock(in_planes, 256, 3, padding=dilations[1], dilation=dilations[1], batch_norm=batch_norm)
+        self.aspp3 = ASPPBlock(in_planes, 256, 3, padding=dilations[2], dilation=dilations[2], batch_norm=batch_norm)
+        self.aspp4 = ASPPBlock(in_planes, 256, 3, padding=dilations[3], dilation=dilations[3], batch_norm=batch_norm)
+
+        self.global_avg_pool = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)),
+                                             nn.Conv2d(in_planes, 256, 1, stride=1, bias=False),
+                                             batch_norm(256),
+                                             nn.ReLU())
+        self.conv1 = nn.Conv2d(1280, 256, 1, bias=False)
+        self.bn1 = batch_norm(256)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.5)
+        self._init_weight()
+
+    def forward(self, x):
+        out1 = self.aspp1(x)
+        out2 = self.aspp2(x)
+        out3 = self.aspp3(x)
+        out4 = self.aspp4(x)
+        out5 = self.global_avg_pool(x)
+        out5 = F.interpolate(out5, size=out4.size()[2:], mode='bilinear', align_corners=True)
+        x = torch.cat((out1, out2, out3, out4, out5), dim=1)
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        return self.dropout(x)
+
+    def _init_weight(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                # m.weight.data.normal_(0, math.sqrt(2. / n))
+                torch.nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+
+class ASPPBlock(nn.Module):
+    def __init__(self, in_planes, planes, kernel_size, padding, dilation, batch_norm):
+        super(ASPPBlock, self).__init__()
+        # Dilated Convolutions (atrous convolution)
+        # Atrous = hole
+        # 연산량을 줄이고 최대한 넓은 영역까지 커버하기 위해, 몇가지의 점들만을 이용하여 풀링하는 방법
+        self.atrous_conv = nn.Conv2d(in_planes, planes, kernel_size=kernel_size, stride=1, padding=padding,
+                                     dilation=dilation, bias=False)
+        self.bn = batch_norm(planes)
+        self.relu = nn.ReLU()
+
+        self._init_weight()
+
+    def forward(self, x):
+        out = self.relu(self.bn(self.atrous_conv(x)))
+
+        return out
+
+    def _init_weight(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                torch.nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
