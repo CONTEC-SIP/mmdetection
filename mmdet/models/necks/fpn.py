@@ -1,17 +1,14 @@
-import warnings
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mmcv.cnn import ConvModule, xavier_init
+from mmcv.runner import auto_fp16
 
 from ..builder import NECKS
-
-from mmcv.cnn import ConvModule
-from mmcv.runner import BaseModule, auto_fp16
-
+import pdb
 
 @NECKS.register_module()
-class FPN(BaseModule):
+class FPN(nn.Module):
     r"""Feature Pyramid Network.
 
     This is an implementation of paper `Feature Pyramid Networks for Object
@@ -48,7 +45,6 @@ class FPN(BaseModule):
             Default: None.
         upsample_cfg (dict): Config dict for interpolate layer.
             Default: `dict(mode='nearest')`
-        init_cfg (dict or list[dict], optional): Initialization config dict.
 
     Example:
         >>> import torch
@@ -80,10 +76,8 @@ class FPN(BaseModule):
                  norm_cfg=None,
                  act_cfg=None,
                  upsample_cfg=dict(mode='nearest'),
-                 modified=None,
-                 init_cfg=dict(
-                     type='Xavier', layer='Conv2d', distribution='uniform')):
-        super(FPN, self).__init__(init_cfg)
+                 modified=None):
+        super(FPN, self).__init__()
         assert isinstance(in_channels, list)
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -112,11 +106,8 @@ class FPN(BaseModule):
             assert add_extra_convs in ('on_input', 'on_lateral', 'on_output')
         elif add_extra_convs:  # True
             if extra_convs_on_inputs:
+                # For compatibility with previous release
                 # TODO: deprecate `extra_convs_on_inputs`
-                warnings.simplefilter('once')
-                warnings.warn(
-                    '"extra_convs_on_inputs" will be deprecated in v2.9.0,'
-                    'Please use "add_extra_convs"', DeprecationWarning)
                 self.add_extra_convs = 'on_input'
             else:
                 self.add_extra_convs = 'on_output'
@@ -125,6 +116,7 @@ class FPN(BaseModule):
         self.fpn_convs = nn.ModuleList()
         if self.modified == 'ASPP':
             self.ASPPs = nn.ModuleList()
+
 
         for i in range(self.start_level, self.backbone_end_level):
             l_conv = ConvModule(
@@ -144,7 +136,7 @@ class FPN(BaseModule):
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg,
                 inplace=False)
-
+            
             if self.modified == 'ASPP':
                 aspp = ASPP(out_channels)
                 self.ASPPs.append(aspp)
@@ -172,6 +164,13 @@ class FPN(BaseModule):
                     inplace=False)
                 self.fpn_convs.append(extra_fpn_conv)
 
+    # default init_weights for conv(msra) and norm in ConvModule
+    def init_weights(self):
+        """Initialize the weights of FPN module."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                xavier_init(m, distribution='uniform')
+
     @auto_fp16()
     def forward(self, inputs):
         """Forward function."""
@@ -182,6 +181,7 @@ class FPN(BaseModule):
             lateral_conv(inputs[i + self.start_level])
             for i, lateral_conv in enumerate(self.lateral_convs)
         ]
+
 
         # build top-down path
         used_backbone_levels = len(laterals)
@@ -195,6 +195,7 @@ class FPN(BaseModule):
                 prev_shape = laterals[i - 1].shape[2:]
                 laterals[i - 1] += F.interpolate(
                     laterals[i], size=prev_shape, **self.upsample_cfg)
+
 
         if self.modified == 'ASPP':
             outs = [
@@ -230,7 +231,26 @@ class FPN(BaseModule):
                         outs.append(self.fpn_convs[i](F.relu(outs[-1])))
                     else:
                         outs.append(self.fpn_convs[i](outs[-1]))
+
         return tuple(outs)
+
+
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
 
 
 class ASPP(nn.Module):
@@ -242,17 +262,21 @@ class ASPP(nn.Module):
         super(ASPP, self).__init__()
         dilations = [1, 6, 12, 18]
         batch_norm = nn.BatchNorm2d
-        self.aspp1 = ASPPBlock(in_planes, 256, 3, padding=1, dilation=dilations[0], batch_norm=batch_norm)
-        self.aspp2 = ASPPBlock(in_planes, 256, 3, padding=dilations[1], dilation=dilations[1], batch_norm=batch_norm)
-        self.aspp3 = ASPPBlock(in_planes, 256, 3, padding=dilations[2], dilation=dilations[2], batch_norm=batch_norm)
-        self.aspp4 = ASPPBlock(in_planes, 256, 3, padding=dilations[3], dilation=dilations[3], batch_norm=batch_norm)
+        if in_planes == 128:
+            out_planes = 128
+        else:
+            out_planes = 256
+        self.aspp1 = ASPPBlock(in_planes, out_planes, 3, padding=1, dilation=dilations[0], batch_norm=batch_norm)
+        self.aspp2 = ASPPBlock(in_planes, out_planes, 3, padding=dilations[1], dilation=dilations[1], batch_norm=batch_norm)
+        self.aspp3 = ASPPBlock(in_planes, out_planes, 3, padding=dilations[2], dilation=dilations[2], batch_norm=batch_norm)
+        self.aspp4 = ASPPBlock(in_planes, out_planes, 3, padding=dilations[3], dilation=dilations[3], batch_norm=batch_norm)
 
         self.global_avg_pool = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)),
-                                             nn.Conv2d(in_planes, 256, 1, stride=1, bias=False),
-                                             batch_norm(256),
+                                             nn.Conv2d(in_planes, out_planes, 1, stride=1, bias=False),
+                                             batch_norm(out_planes),
                                              nn.ReLU())
-        self.conv1 = nn.Conv2d(1280, 256, 1, bias=False)
-        self.bn1 = batch_norm(256)
+        self.conv1 = nn.Conv2d(out_planes*5, out_planes, 1, bias=False)
+        self.bn1 = batch_norm(out_planes)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.5)
         self._init_weight()
@@ -271,7 +295,6 @@ class ASPP(nn.Module):
         x = self.relu(x)
 
         return self.dropout(x)
-
     def _init_weight(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -281,7 +304,6 @@ class ASPP(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
-
 
 class ASPPBlock(nn.Module):
     def __init__(self, in_planes, planes, kernel_size, padding, dilation, batch_norm):
